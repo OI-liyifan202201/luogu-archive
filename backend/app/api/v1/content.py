@@ -67,6 +67,7 @@ class ArticleDetail(BaseModel):
     author: _UserBrief | None
     source_time: datetime | None
     crawled_at: datetime
+    last_crawled_at: datetime
     version_count: int
 
 
@@ -312,6 +313,7 @@ async def get_article(
         author=await _user_brief(db, art.author_uid),
         source_time=art.source_time,
         crawled_at=v.crawled_at,
+        last_crawled_at=art.last_crawled_at,
         version_count=versions_count,
     )
 
