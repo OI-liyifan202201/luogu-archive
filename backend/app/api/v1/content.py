@@ -65,6 +65,7 @@ class ArticleDetail(BaseModel):
     content_md: str
     admin_note: str | None
     author: _UserBrief | None
+    source_time: datetime | None
     crawled_at: datetime
     version_count: int
 
@@ -73,6 +74,7 @@ class PasteDetail(BaseModel):
     paste_id: str
     content_md: str
     author: _UserBrief | None
+    source_time: datetime | None
     crawled_at: datetime
     version_count: int
 
@@ -308,6 +310,7 @@ async def get_article(
         content_md=v.content_md,
         admin_note=art.admin_note,
         author=await _user_brief(db, art.author_uid),
+        source_time=art.source_time,
         crawled_at=v.crawled_at,
         version_count=versions_count,
     )
@@ -382,6 +385,7 @@ async def get_paste(
         paste_id=paste_id,
         content_md=v.content_md,
         author=await _user_brief(db, p.author_uid),
+        source_time=p.source_time,
         crawled_at=v.crawled_at,
         version_count=versions_count,
     )
