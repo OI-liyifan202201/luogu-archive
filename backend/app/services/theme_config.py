@@ -51,12 +51,15 @@ def normalize_config(raw: dict) -> dict:
     colors = body.get("color", [])
     if not isinstance(colors, list) or len(colors) > 20:
         raise ValidationError("最多支持 20 个中景颜色")
+    # 洛谷使用 ±1000 表示淡出方向，归一化后兼容本站原有的 ±1 配置。
+    fade = number(body.get("fade", 0), -1000, 1000)
+    fade = 1 if fade > 0 else -1 if fade < 0 else 0
     return {
         "lNavi": {"back": color(nav.get("back", "#ffffff")), "fore": color(nav.get("fore", "#333333")), "logo": color(nav["logo"]) if nav.get("logo") else None},
         "lBody": {
             "back": color(body.get("back", "#efefef")), "image": image,
             "color": [color(v) for v in colors if v], "blur": blur,
-            "fade": number(body.get("fade", 0), -1, 1),
+            "fade": fade,
             "midOpts": {"degree": number(opts.get("degree", 0), 0, 360), "brightness": number(opts.get("brightness", 0), -100, 100), "repeat": repeat, "size": size, "position": [number(v, 0, 100) for v in position]},
         },
     }
