@@ -1,0 +1,26 @@
+# 资源感知型爬虫 worker。每个实例都会按 hi -> mid -> low 严格尝试领取。
+# 部署示例：
+#   cp luogu-archive-worker@.service /etc/systemd/system/
+#   systemctl enable --now luogu-archive-worker@1.service
+#   systemctl enable --now luogu-archive-worker@2.service
+
+[Unit]
+Description=luogu-archive resource worker instance=%i
+After=network.target redis.service mysql.service
+
+[Service]
+Type=simple
+User=luogu
+Group=luogu
+WorkingDirectory=/srv/luogu-archive/backend
+EnvironmentFile=/srv/luogu-archive/backend/.env
+ExecStart=/srv/luogu-archive/backend/.venv/bin/python -m scripts.priority_worker
+Restart=always
+RestartSec=5
+ReadWritePaths=/srv/luogu-archive/backend /var/www/luogu-archive
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+# ======================================================================
+# luogu-archive · 一键启动（宝塔兼容版）
+# ======================================================================
+# 所有服务在后台运行，PID 写到 ./run/，日志写到 ./logs/
+# 启动前先跑过 ./install.sh 生成 .env 并装好依赖
+#
+# 启动列表：
+#   - backend  FastAPI (uvicorn)        监听 127.0.0.1:8000
+#   - worker   资源感知队列，严格消费 3 个优先级
+#   - scheduler  APScheduler 定时任务
+#   - frontend  Nuxt 生产 node 服务      监听 127.0.0.1:3000
+#
+# 然后在宝塔 Nginx 里把域名反代到这两个端口即可（详见 docs/BAOTA.md）
+#
+# 用法：
+#   ./start.sh             启动全部
+#   ./start.sh backend     只启动 backend
+#   ./start.sh frontend -dev  前端开发模式，不要求 build
+#   ./start.sh -dev        启动全部，前端使用开发模式
+#   ./start.sh status      查看状态
+# ======================================================================
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BACKEND="$ROOT_DIR/backend"
+FRONTEND="$ROOT_DIR/frontend"
+RUN="$ROOT_DIR/run"
+LOGS="$ROOT_DIR/logs"
+PY="$BACKEND/.venv/bin/python"
+UVICORN="$BACKEND/.venv/bin/uvicorn"
+
+mkdir -p "$RUN" "$LOGS"
+
+# ---------- 前置检查 ----------
+cmd="${1:-all}"
+frontend_dev=false
+if [ "$cmd" = "-dev" ]; then
+    cmd=all
+    frontend_dev=true
+fi
+if [ "$#" -gt 0 ]; then shift; fi
+for arg in "$@"; do
+    if [ "$arg" = "-dev" ] && [ "$frontend_dev" = false ]; then
+        frontend_dev=true
+    else
+        echo "用法: $0 [all|backend|worker|scheduler|frontend|status] [-dev]" >&2
+        exit 1
+    fi
+done
+if [ "$frontend_dev" = true ] && [ "$cmd" != all ] && [ "$cmd" != frontend ]; then
+    echo "!! -dev 仅适用于 all 或 frontend" >&2
+    exit 1
+fi
+
+# 只启动前端或查询状态时，不要求安装后端环境，方便独立部署预览站。
+case "$cmd" in
+    all|backend|worker|scheduler)
+        [ -f "$BACKEND/.env" ] || { echo "!! 未找到 $BACKEND/.env，先跑 ./install.sh" >&2; exit 1; }
+        [ -x "$PY" ] || { echo "!! 未找到 venv，先跑 ./install.sh" >&2; exit 1; }
+        ;;
+esac
+
+# 后端单独启动不依赖前端构建；启动全部时仍在启动任何服务前检查两侧。
+case "$cmd" in
+    all|frontend)
+        [ -f "$FRONTEND/.env" ] || { echo "!! 未找到 $FRONTEND/.env，请先配置前端环境变量" >&2; exit 1; }
+        if [ "$frontend_dev" = true ]; then
+            command -v pnpm >/dev/null 2>&1 || { echo "!! 未找到 pnpm，请先安装" >&2; exit 1; }
+            [ -f "$FRONTEND/node_modules/.bin/nuxt" ] || { echo "!! 前端依赖未安装，请先执行 (cd frontend && pnpm install)" >&2; exit 1; }
+        else
+            [ -f "$FRONTEND/.output/server/index.mjs" ] || { echo "!! 前端未构建，请先执行 (cd frontend && pnpm build)" >&2; exit 1; }
+        fi
+        ;;
+esac
+
+# 从 .env 读端口（简单 grep）
+get_env() {
+    grep -E "^$1=" "$BACKEND/.env" | head -1 | cut -d= -f2-
+}
+BACKEND_PORT=8000
+FRONTEND_PORT=3000
+
+# 只读取实际需要的端口；配置未写端口时使用默认值，不因 grep 无匹配退出。
+case "$cmd" in
+    all|backend)
+        BACKEND_PORT=$(get_env WEB_PORT || true)
+        BACKEND_PORT=${BACKEND_PORT:-8000}
+        ;;
+esac
+case "$cmd" in
+    all|frontend)
+        FRONTEND_PORT=$(grep -E "^PORT=" "$FRONTEND/.env" | head -1 | cut -d= -f2 || true)
+        FRONTEND_PORT=${FRONTEND_PORT:-3000}
+        ;;
+esac
+
+# ---------- 启停工具 ----------
+pidfile() { echo "$RUN/$1.pid"; }
+logfile() { echo "$LOGS/$1.log"; }
+
+is_running() {
+    local pf="$(pidfile "$1")"
+    [ -f "$pf" ] || return 1
+    local pid=$(cat "$pf")
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+start_one() {
+    local name="$1"; shift
+    if is_running "$name"; then
+        echo "  [$name] 已在运行 (pid $(cat "$(pidfile "$name")"))"
+        return
+    fi
+    echo "  [$name] 启动..."
+    # 用 nohup + & 把进程放入后台；setsid 保证脱离终端
+    setsid "$@" >> "$(logfile "$name")" 2>&1 < /dev/null &
+    echo $! > "$(pidfile "$name")"
+    sleep 1
+    if is_running "$name"; then
+        echo "  [$name] ✓ pid=$(cat "$(pidfile "$name")")  日志 $(logfile "$name")"
+    else
+        echo "  [$name] ✗ 启动失败，查看 $(logfile "$name")"
+        return 1
+    fi
+}
+
+# ---------- 端口占用检测 ----------
+# 返回 0 = 占用 / 返回 1 = 空闲
+port_in_use() {
+    local port="$1"
+    ss -tln 2>/dev/null | awk '{print $4}' | grep -Eq ":${port}\$"
+}
+
+check_port_free() {
+    local name="$1" port="$2"
+    if port_in_use "$port"; then
+        echo "  [$name] ✗ 端口 $port 已被占用"
+        ss -tlnp 2>/dev/null | awk -v p=":$port" '$4 ~ p {print "         占用进程: "$0}'
+        echo "         用 'kill <pid>' 杀掉旧进程，或改 .env 的端口号"
+        return 1
+    fi
+    return 0
+}
+
+# ---------- 各服务启动命令 ----------
+start_backend() {
+    check_port_free backend "$BACKEND_PORT" || return 1
+    cd "$BACKEND"
+    start_one backend "$UVICORN" app.main:app \
+        --host 127.0.0.1 --port "$BACKEND_PORT" --workers 2
+}
+
+start_worker() {
+    cd "$BACKEND"
+    start_one worker "$PY" -m scripts.priority_worker
+}
+
+start_scheduler() {
+    cd "$BACKEND"
+    start_one scheduler "$PY" -m app.scheduler
+}
+
+start_frontend() {
+    check_port_free frontend "$FRONTEND_PORT" || return 1
+    cd "$FRONTEND"
+    # 读前端 .env 作为环境
+    set -a; source "$FRONTEND/.env"; set +a
+    if [ "$frontend_dev" = true ]; then
+        start_one frontend /usr/bin/env NODE_ENV=development pnpm dev \
+            --host 127.0.0.1 --port "$FRONTEND_PORT"
+    else
+        start_one frontend /usr/bin/env node "$FRONTEND/.output/server/index.mjs"
+    fi
+}
+
+# ---------- 状态 ----------
+status() {
+    for s in backend worker scheduler frontend; do
+        if is_running "$s"; then
+            echo "  [$s] ✓ running (pid $(cat "$(pidfile "$s")"))"
+        else
+            echo "  [$s] ✗ stopped"
+        fi
+    done
+}
+
+# ---------- 主逻辑 ----------
+case "$cmd" in
+    all)
+        echo ">>> 启动 luogu-archive"
+        start_backend
+        start_worker
+        start_scheduler
+        start_frontend
+        echo ""
+        echo "监听端口："
+        echo "  后端  127.0.0.1:$BACKEND_PORT"
+        echo "  前端  127.0.0.1:$FRONTEND_PORT"
+        echo ""
+        echo "请在宝塔 Nginx 里把域名反代到前端端口（API 走 /api/ 反代到后端）。"
+        echo "具体 nginx 片段见 docs/BAOTA.md"
+        ;;
+    backend)   start_backend ;;
+    worker)    start_worker ;;
+    scheduler) start_scheduler ;;
+    frontend)  start_frontend ;;
+    status)    status ;;
+    *)
+        echo "用法: $0 [all|backend|worker|scheduler|frontend|status] [-dev]"
+        exit 1
+        ;;
+esac

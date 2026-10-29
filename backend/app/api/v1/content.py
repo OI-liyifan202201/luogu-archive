@@ -1,0 +1,1070 @@
+"""内容查询 API —— 文章、剪贴板、陶片、伪全网犇、题目列表。
+
+所有 GET 端点都做 stale-while-revalidate（数据过期时异步重爬，不阻塞）。
+"""
+from __future__ import annotations
+
+from collections import defaultdict
+from datetime import datetime
+
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel, Field
+from sqlalchemy import desc, func, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.config import settings
+from app.core.db import get_db
+from app.core.exceptions import NotFoundError
+from app.crawler.revalidate import (
+    is_stale,
+    schedule_refresh_article,
+    schedule_refresh_paste,
+)
+from app.models.luogu_content import (
+    Article,
+    ArticleVersion,
+    Discussion,
+    DiscussionReply,
+    DiscussionReplyVersion,
+    DiscussionVersion,
+    Feed,
+    Judgement,
+    Paste,
+    PasteVersion,
+    Problem,
+    ProblemSolutionHistory,
+)
+from app.services.content_suppression import ensure_content_visible, visible_content_clause
+from app.models.luogu_user import LuoguUser
+from app.services.feed_merge import merge_feed_rows
+
+router = APIRouter(tags=["content"])
+
+
+# ============================================================
+# Schemas
+# ============================================================
+
+class _UserBrief(BaseModel):
+    uid: int
+    name: str
+    color: str
+    badge: str | None
+    avatar: str | None
+    # 钩子（OI 认证）等级：0-2 不显示，3-5 绿，6-7 蓝，8+ 金
+    ccf_level: int = 0
+    # 气球（XCPC 认证）等级：0-2 不显示，3-5 绿，6-7 蓝，8+ 金（与钩子规则相同）
+    xcpc_level: int = 0
+    # 是否管理员（决定 badge 是否当作管理员标识渲染）
+    is_admin: bool = False
+
+
+class ArticleDetail(BaseModel):
+    article_id: str
+    title: str
+    content_md: str
+    admin_note: str | None
+    author: _UserBrief | None
+    crawled_at: datetime
+    version_count: int
+
+
+class PasteDetail(BaseModel):
+    paste_id: str
+    content_md: str
+    author: _UserBrief | None
+    crawled_at: datetime
+    version_count: int
+
+
+class ContentVersionItem(BaseModel):
+    id: int
+    title: str | None = None
+    content_md: str
+    content_hash: str
+    crawled_at: datetime
+    is_current: bool
+
+
+class ArticleHistoryResp(BaseModel):
+    article_id: str
+    title: str
+    versions: list[ContentVersionItem]
+
+
+class PasteHistoryResp(BaseModel):
+    paste_id: str
+    versions: list[ContentVersionItem]
+
+
+class DiscussionReplyItem(BaseModel):
+    reply_id: int
+    content_md: str
+    author: _UserBrief | None
+    source_time: datetime | None
+    crawled_at: datetime
+
+
+class DiscussionDetail(BaseModel):
+    discussion_id: int
+    title: str
+    content_md: str
+    author: _UserBrief | None
+    forum_name: str | None
+    source_time: datetime | None
+    crawled_at: datetime
+    source_reply_count: int
+    stored_reply_count: int
+    page: int
+    per_page: int
+    replies: list[DiscussionReplyItem]
+
+
+class DiscussionListItem(BaseModel):
+    discussion_id: int
+    title: str
+    author: _UserBrief | None
+    forum_name: str | None
+    source_time: datetime | None
+    crawled_at: datetime
+    stored_reply_count: int
+    latest_reply_author: _UserBrief | None
+    latest_reply_time: datetime | None
+
+
+class DiscussionForumItem(BaseModel):
+    name: str
+    slug: str
+    count: int
+
+
+class DiscussionListResponse(BaseModel):
+    items: list[DiscussionListItem]
+    forums: list[DiscussionForumItem]
+    total: int
+    page: int
+    page_size: int
+
+
+class DiscussionRefreshResponse(BaseModel):
+    queued: bool
+    message: str
+    retry_after: int = 0
+
+
+class FeedItem(BaseModel):
+    id: int
+    type: int
+    time: datetime
+    content_md: str
+    # 非空表示正文末尾有一段由回复关联自动补回的内容，前端会加下划线提示。
+    merged_suffix_md: str | None = None
+    merged_from_id: int | None = None
+    merged_link_md: list[str] = Field(default_factory=list)
+    merged_image_md: list[str] = Field(default_factory=list)
+    user: _UserBrief | None = None
+
+
+class JudgementGroup(BaseModel):
+    group_key: str
+    reason: str
+    revoked_permission: int
+    added_permission: int
+    time_start: datetime
+    time_end: datetime
+    users: list[_UserBrief]
+    count: int
+
+
+class ProblemItem(BaseModel):
+    pid: str
+    title: str
+    difficulty: str | None
+    tags: list[int | str] = Field(default_factory=list)
+    solution_open: bool
+
+
+class ProblemSolutionHistoryItem(BaseModel):
+    solution_open: bool
+    changed_at: datetime
+
+
+class ProblemDetail(ProblemItem):
+    last_solution_check_at: datetime | None
+    solution_history: list[ProblemSolutionHistoryItem] = Field(default_factory=list)
+    first_seen_at: datetime
+    updated_at: datetime
+
+
+class ProblemDifficultyBucket(BaseModel):
+    """每档难度的预览：前 N 条 + 该档总数。前端据此决定是否显示"查看全部"。"""
+    items: list[ProblemItem]
+    total: int
+
+
+_PROBLEM_DIFFICULTY_ALIASES = {
+    "普及/提高-": "普及",
+    "普及+/提高": "普及+/提高-",
+    "NOI/NOI+/CTSC": "NOI/NOI+/CTS",
+    "unknown_8": "NOI/NOI+/CTS",
+}
+_PROBLEM_DIFFICULTY_REVERSE_ALIASES: dict[str, list[str]] = defaultdict(list)
+for _old_diff, _new_diff in _PROBLEM_DIFFICULTY_ALIASES.items():
+    _PROBLEM_DIFFICULTY_REVERSE_ALIASES[_new_diff].append(_old_diff)
+
+
+def _problem_difficulty_name(value: str | None) -> str:
+    name = value or "暂无评定"
+    return _PROBLEM_DIFFICULTY_ALIASES.get(name, name)
+
+
+def _problem_difficulty_values(name: str) -> list[str]:
+    canonical = _problem_difficulty_name(name)
+    return [canonical, *_PROBLEM_DIFFICULTY_REVERSE_ALIASES.get(canonical, [])]
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+async def _user_brief(session: AsyncSession, uid: int | None) -> _UserBrief | None:
+    if uid is None:
+        return None
+    u = await session.get(LuoguUser, uid)
+    if u is None:
+        return None
+    return _UserBrief(
+        uid=u.uid,
+        name=u.name,
+        color=u.color.value,
+        badge=u.badge,
+        avatar=u.avatar,
+        ccf_level=u.ccf_level or 0,
+        xcpc_level=u.xcpc_level or 0,
+        is_admin=u.is_admin,
+    )
+
+
+async def _user_brief_map(
+    session: AsyncSession,
+    uids: set[int],
+) -> dict[int, _UserBrief]:
+    if not uids:
+        return {}
+    users = (
+        await session.execute(select(LuoguUser).where(LuoguUser.uid.in_(uids)))
+    ).scalars().all()
+    return {
+        user.uid: _UserBrief(
+            uid=user.uid,
+            name=user.name,
+            color=user.color.value,
+            badge=user.badge,
+            avatar=user.avatar,
+            ccf_level=user.ccf_level or 0,
+            xcpc_level=user.xcpc_level or 0,
+            is_admin=user.is_admin,
+        )
+        for user in users
+    }
+
+
+# ============================================================
+# Article
+# ============================================================
+
+@router.get("/article/{article_id}", response_model=ArticleDetail)
+async def get_article(
+    article_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> ArticleDetail:
+    await ensure_content_visible(db, "article", article_id)
+    art = await db.get(Article, article_id)
+    if art is not None:
+        await ensure_content_visible(db, "article", article_id, art.author_uid)
+    if art is None:
+        # 未爬过 → 立即派发一次高优先级爬取，并返回 404
+        from app.tasks.actors.crawl import crawl_article
+        crawl_article.send(article_id, "passive")
+        raise NotFoundError("文章未被本站收录，已触发爬取，请稍后刷新")
+
+    v: ArticleVersion | None = None
+    if art.current_version_id:
+        v = await db.get(ArticleVersion, art.current_version_id)
+    if v is None:
+        raise NotFoundError("文章版本缺失")
+
+    # 计数版本
+    count_q = select(ArticleVersion).where(ArticleVersion.article_id == article_id)
+    versions_count = len((await db.execute(count_q)).all())
+
+    # 被动刷新
+    if is_stale(art.last_crawled_at):
+        await schedule_refresh_article(article_id)
+
+    return ArticleDetail(
+        article_id=article_id,
+        title=v.title,
+        content_md=v.content_md,
+        admin_note=art.admin_note,
+        author=await _user_brief(db, art.author_uid),
+        crawled_at=v.crawled_at,
+        version_count=versions_count,
+    )
+
+
+@router.get("/article/{article_id}/history", response_model=ArticleHistoryResp)
+async def get_article_history(
+    article_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> ArticleHistoryResp:
+    await ensure_content_visible(db, "article", article_id)
+    art = await db.get(Article, article_id)
+    if art is not None:
+        await ensure_content_visible(db, "article", article_id, art.author_uid)
+    if art is None:
+        raise NotFoundError("文章未被本站收录")
+
+    q = (
+        select(ArticleVersion)
+        .where(ArticleVersion.article_id == article_id)
+        .order_by(desc(ArticleVersion.crawled_at), desc(ArticleVersion.id))
+    )
+    versions = (await db.execute(q)).scalars().all()
+    return ArticleHistoryResp(
+        article_id=article_id,
+        title=art.title,
+        versions=[
+            ContentVersionItem(
+                id=v.id,
+                title=v.title,
+                content_md=v.content_md,
+                content_hash=v.content_hash,
+                crawled_at=v.crawled_at,
+                is_current=v.id == art.current_version_id,
+            )
+            for v in versions
+        ],
+    )
+
+
+# ============================================================
+# Paste
+# ============================================================
+
+@router.get("/paste/{paste_id}", response_model=PasteDetail)
+async def get_paste(
+    paste_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> PasteDetail:
+    await ensure_content_visible(db, "paste", paste_id)
+    p = await db.get(Paste, paste_id)
+    if p is not None:
+        await ensure_content_visible(db, "paste", paste_id, p.author_uid)
+    if p is None:
+        from app.tasks.actors.crawl import crawl_paste
+        crawl_paste.send(paste_id, "passive")
+        raise NotFoundError("剪贴板未被本站收录，已触发爬取")
+
+    v: PasteVersion | None = None
+    if p.current_version_id:
+        v = await db.get(PasteVersion, p.current_version_id)
+    if v is None:
+        raise NotFoundError("剪贴板版本缺失")
+
+    count_q = select(PasteVersion).where(PasteVersion.paste_id == paste_id)
+    versions_count = len((await db.execute(count_q)).all())
+
+    if is_stale(p.last_crawled_at):
+        await schedule_refresh_paste(paste_id)
+
+    return PasteDetail(
+        paste_id=paste_id,
+        content_md=v.content_md,
+        author=await _user_brief(db, p.author_uid),
+        crawled_at=v.crawled_at,
+        version_count=versions_count,
+    )
+
+
+@router.get("/paste/{paste_id}/history", response_model=PasteHistoryResp)
+async def get_paste_history(
+    paste_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> PasteHistoryResp:
+    await ensure_content_visible(db, "paste", paste_id)
+    paste = await db.get(Paste, paste_id)
+    if paste is not None:
+        await ensure_content_visible(db, "paste", paste_id, paste.author_uid)
+    if paste is None:
+        raise NotFoundError("剪贴板未被本站收录")
+
+    q = (
+        select(PasteVersion)
+        .where(PasteVersion.paste_id == paste_id)
+        .order_by(desc(PasteVersion.crawled_at), desc(PasteVersion.id))
+    )
+    versions = (await db.execute(q)).scalars().all()
+    return PasteHistoryResp(
+        paste_id=paste_id,
+        versions=[
+            ContentVersionItem(
+                id=v.id,
+                title=None,
+                content_md=v.content_md,
+                content_hash=v.content_hash,
+                crawled_at=v.crawled_at,
+                is_current=v.id == paste.current_version_id,
+            )
+            for v in versions
+        ],
+    )
+
+
+# ============================================================
+# 讨论区
+# ============================================================
+
+@router.get("/discuss", response_model=DiscussionListResponse)
+async def list_discussions(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(30, ge=1, le=100),
+    q: str = Query("", max_length=128),
+    forum: str = Query("", max_length=64),
+    db: AsyncSession = Depends(get_db),
+) -> DiscussionListResponse:
+    keyword = q.strip()
+    # 列表、总数与板块数量都排除已下架主帖，不暴露标题或回复摘要。
+    filters = [Discussion.current_version_id.is_not(None),
+        visible_content_clause("discuss", Discussion.discussion_id, Discussion.author_uid)]
+    if forum:
+        filters.append(Discussion.forum_slug == forum.strip())
+    if keyword:
+        search_filters = [
+            DiscussionVersion.title.like(f"%{keyword}%"),
+            Discussion.forum_name.like(f"%{keyword}%"),
+        ]
+        if keyword.isdigit():
+            search_filters.append(Discussion.discussion_id == int(keyword))
+        filters.append(or_(*search_filters))
+
+    count_stmt = (
+        select(func.count(Discussion.discussion_id))
+        .select_from(Discussion)
+        .join(
+            DiscussionVersion,
+            DiscussionVersion.id == Discussion.current_version_id,
+        )
+        .where(*filters)
+    )
+    total = int(await db.scalar(count_stmt) or 0)
+
+    forum_rows = (
+        await db.execute(
+            select(
+                Discussion.forum_name,
+                Discussion.forum_slug,
+                func.count(Discussion.discussion_id),
+            )
+            .where(
+                Discussion.current_version_id.is_not(None),
+                Discussion.forum_name.is_not(None),
+                Discussion.forum_slug.is_not(None),
+                visible_content_clause("discuss", Discussion.discussion_id, Discussion.author_uid),
+            )
+            .group_by(Discussion.forum_name, Discussion.forum_slug)
+            .order_by(desc(func.count(Discussion.discussion_id)))
+        )
+    ).all()
+
+    reply_counts = (
+        select(
+            DiscussionReply.discussion_id.label("discussion_id"),
+            func.count(DiscussionReply.reply_id).label("reply_count"),
+        )
+        .join(
+            DiscussionReplyVersion,
+            DiscussionReplyVersion.id == DiscussionReply.current_version_id,
+        )
+        .where(
+            DiscussionReplyVersion.content_md != "",
+            func.length(func.trim(DiscussionReplyVersion.content_md)) > 0,
+        )
+        .group_by(DiscussionReply.discussion_id)
+        .subquery()
+    )
+    stmt = (
+        select(
+            Discussion,
+            DiscussionVersion,
+            func.coalesce(reply_counts.c.reply_count, 0),
+        )
+        .join(
+            DiscussionVersion,
+            DiscussionVersion.id == Discussion.current_version_id,
+        )
+        .outerjoin(
+            reply_counts,
+            reply_counts.c.discussion_id == Discussion.discussion_id,
+        )
+        .where(*filters)
+        .order_by(
+            desc(Discussion.last_crawled_at),
+            desc(Discussion.discussion_id),
+        )
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+    rows = (await db.execute(stmt)).all()
+    discussion_ids = [discussion.discussion_id for discussion, _version, _count in rows]
+    latest_replies: dict[int, DiscussionReply] = {}
+    if discussion_ids:
+        latest_reply_ids = (
+            select(
+                DiscussionReply.discussion_id.label("discussion_id"),
+                func.max(DiscussionReply.reply_id).label("reply_id"),
+            )
+            .join(
+                DiscussionReplyVersion,
+                DiscussionReplyVersion.id == DiscussionReply.current_version_id,
+            )
+            .where(
+                DiscussionReply.discussion_id.in_(discussion_ids),
+                DiscussionReplyVersion.content_md != "",
+                func.length(func.trim(DiscussionReplyVersion.content_md)) > 0,
+            )
+            .group_by(DiscussionReply.discussion_id)
+            .subquery()
+        )
+        reply_rows = (
+            await db.execute(
+                select(DiscussionReply)
+                .join(
+                    latest_reply_ids,
+                    latest_reply_ids.c.reply_id == DiscussionReply.reply_id,
+                )
+            )
+        ).scalars().all()
+        for reply in reply_rows:
+            latest_replies[reply.discussion_id] = reply
+
+    users = await _user_brief_map(
+        db,
+        {
+            uid
+            for discussion, _version, _count in rows
+            for uid in (
+                discussion.author_uid,
+                latest_replies.get(discussion.discussion_id).author_uid
+                if latest_replies.get(discussion.discussion_id)
+                else None,
+            )
+            if uid
+        },
+    )
+
+    return DiscussionListResponse(
+        items=[
+            DiscussionListItem(
+                discussion_id=discussion.discussion_id,
+                title=version.title,
+                author=users.get(discussion.author_uid) if discussion.author_uid else None,
+                forum_name=discussion.forum_name,
+                source_time=discussion.source_time,
+                crawled_at=version.crawled_at,
+                stored_reply_count=int(reply_count),
+                latest_reply_author=(
+                    users.get(latest_replies[discussion.discussion_id].author_uid)
+                    if discussion.discussion_id in latest_replies
+                    and latest_replies[discussion.discussion_id].author_uid
+                    else None
+                ),
+                latest_reply_time=(
+                    latest_replies[discussion.discussion_id].source_time
+                    if discussion.discussion_id in latest_replies
+                    else None
+                ),
+            )
+            for discussion, version, reply_count in rows
+        ],
+        forums=[
+            DiscussionForumItem(name=name, slug=slug, count=int(count))
+            for name, slug, count in forum_rows
+        ],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.post("/discuss/refresh", response_model=DiscussionRefreshResponse)
+async def refresh_discussions() -> DiscussionRefreshResponse:
+    """提交一次讨论区首页发现任务；全站共享短冷却以避免重复抓取。"""
+    from app.core.redis_client import get_redis
+    from app.tasks.actors.crawl import discover_from_discuss_hi
+
+    redis = get_redis()
+    cooldown_key = "manual:discussion_discovery"
+    queued = await redis.set(cooldown_key, "1", ex=60, nx=True)
+    if not queued:
+        retry_after = max(1, int(await redis.ttl(cooldown_key)))
+        return DiscussionRefreshResponse(
+            queued=False,
+            message="更新任务刚刚提交过，请稍后再试",
+            retry_after=retry_after,
+        )
+
+    discover_from_discuss_hi.send("manual")
+    return DiscussionRefreshResponse(
+        queued=True,
+        message="更新任务已提交",
+    )
+
+
+@router.get("/discuss/{discussion_id}", response_model=DiscussionDetail)
+async def get_discussion(
+    discussion_id: int,
+    page: int = Query(1, ge=1),
+    per_page: int = Query(10, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+) -> DiscussionDetail:
+    await ensure_content_visible(db, "discuss", str(discussion_id))
+    discussion = await db.get(Discussion, discussion_id)
+    if discussion is None:
+        from app.crawler.sources.discussion import enqueue_discussion_crawl
+
+        await enqueue_discussion_crawl(
+            discussion_id,
+            page=1,
+            trigger="passive",
+            enqueue_remaining=True,
+            background=False,
+        )
+        raise NotFoundError("讨论未被本站收录，已触发爬取，请稍后刷新")
+
+    # 隐藏检查先于正文、回复和修复任务，翻页不能绕过整帖下架。
+    await ensure_content_visible(db, "discuss", str(discussion_id), discussion.author_uid)
+
+    version = (
+        await db.get(DiscussionVersion, discussion.current_version_id)
+        if discussion.current_version_id
+        else None
+    )
+    if version is None:
+        raise NotFoundError("讨论主帖版本缺失")
+
+    stored_count = int(
+        await db.scalar(
+            select(func.count(DiscussionReply.reply_id))
+            .join(
+                DiscussionReplyVersion,
+                DiscussionReplyVersion.id == DiscussionReply.current_version_id,
+            )
+            .where(
+                DiscussionReply.discussion_id == discussion_id,
+                DiscussionReplyVersion.content_md != "",
+                func.length(func.trim(DiscussionReplyVersion.content_md)) > 0,
+            )
+        )
+        or 0
+    )
+    blank_count = int(
+        await db.scalar(
+            select(func.count(DiscussionReply.reply_id))
+            .join(
+                DiscussionReplyVersion,
+                DiscussionReplyVersion.id == DiscussionReply.current_version_id,
+            )
+            .where(
+                DiscussionReply.discussion_id == discussion_id,
+                or_(
+                    DiscussionReplyVersion.content_md == "",
+                    func.length(func.trim(DiscussionReplyVersion.content_md)) == 0,
+                ),
+            )
+        )
+        or 0
+    )
+    if blank_count:
+        try:
+            from app.core.redis_client import get_redis
+            from app.crawler.sources.discussion import enqueue_discussion_crawl
+
+            redis = get_redis()
+            repair_key = f"repair:discussion_empty_reply:{discussion_id}"
+            if await redis.set(repair_key, "1", ex=300, nx=True):
+                await enqueue_discussion_crawl(
+                    discussion_id,
+                    page=0,
+                    trigger="passive",
+                    enqueue_remaining=True,
+                    background=False,
+                )
+        except Exception:
+            # 修复任务不可用不应阻断已有内容的读取。
+            pass
+    rows = (
+        await db.execute(
+            select(DiscussionReply, DiscussionReplyVersion)
+            .join(
+                DiscussionReplyVersion,
+                DiscussionReplyVersion.id == DiscussionReply.current_version_id,
+            )
+            .where(
+                DiscussionReply.discussion_id == discussion_id,
+                DiscussionReplyVersion.content_md != "",
+                func.length(func.trim(DiscussionReplyVersion.content_md)) > 0,
+            )
+            .order_by(DiscussionReply.source_time.asc(), DiscussionReply.reply_id.asc())
+            .offset((page - 1) * per_page)
+            .limit(per_page)
+        )
+    ).all()
+    # 兼容旧版爬虫已经写入的空正文，避免空回复卡片漏到前端。
+    rows = [
+        (reply, reply_version)
+        for reply, reply_version in rows
+        if str(reply_version.content_md or "").strip()
+    ]
+    uids = {reply.author_uid for reply, _version in rows if reply.author_uid is not None}
+    if discussion.author_uid is not None:
+        uids.add(discussion.author_uid)
+    users = await _user_brief_map(db, uids)
+
+    return DiscussionDetail(
+        discussion_id=discussion_id,
+        title=version.title,
+        content_md=version.content_md,
+        author=users.get(discussion.author_uid) if discussion.author_uid else None,
+        forum_name=discussion.forum_name,
+        source_time=discussion.source_time,
+        crawled_at=version.crawled_at,
+        source_reply_count=discussion.observed_reply_count,
+        stored_reply_count=stored_count,
+        page=page,
+        per_page=per_page,
+        replies=[
+            DiscussionReplyItem(
+                reply_id=reply.reply_id,
+                content_md=reply_version.content_md,
+                author=users.get(reply.author_uid) if reply.author_uid else None,
+                source_time=reply.source_time,
+                crawled_at=reply_version.crawled_at,
+            )
+            for reply, reply_version in rows
+        ],
+    )
+
+
+# ============================================================
+# 伪全网犇（按时间倒序）
+# ============================================================
+
+@router.get("/feed", response_model=list[FeedItem])
+async def global_feed(
+    limit: int = Query(50, ge=1, le=200),
+    before: datetime | None = Query(None, description="分页锚点：拿早于此时间的"),
+    db: AsyncSession = Depends(get_db),
+) -> list[FeedItem]:
+    q = select(Feed).where(
+        visible_content_clause("feed", Feed.id, Feed.author_uid)
+    ).order_by(desc(Feed.time)).limit(limit)
+    if before is not None:
+        q = q.where(Feed.time < before)
+    rows = (await db.execute(q)).scalars().all()
+    merged = await merge_feed_rows(db, rows)
+
+    items: list[FeedItem] = []
+    for r in rows:
+        user = await _user_brief(db, r.author_uid)
+        display = merged[int(r.id)]
+        items.append(
+            FeedItem(
+                id=r.id,
+                type=r.type,
+                time=r.time,
+                content_md=display.content_md,
+                merged_suffix_md=display.merged_suffix_md,
+                merged_from_id=display.merged_from_id,
+                merged_link_md=list(display.merged_link_md),
+                merged_image_md=list(display.merged_image_md),
+                user=user,
+            )
+        )
+    return items
+
+
+@router.get("/feed/{feed_id}", response_model=FeedItem)
+async def get_feed(
+    feed_id: int,
+    db: AsyncSession = Depends(get_db),
+) -> FeedItem:
+    """返回分享地址对应的单条犇犇，不附带其他列表内容。"""
+    await ensure_content_visible(db, "feed", str(feed_id))
+    row = await db.get(Feed, feed_id)
+    if row is None:
+        raise NotFoundError("犇犇未被本站收录")
+    await ensure_content_visible(db, "feed", str(feed_id), row.author_uid)
+    display = (await merge_feed_rows(db, [row]))[feed_id]
+    return FeedItem(
+        id=row.id,
+        type=row.type,
+        time=row.time,
+        content_md=display.content_md,
+        merged_suffix_md=display.merged_suffix_md,
+        merged_from_id=display.merged_from_id,
+        merged_link_md=list(display.merged_link_md),
+        merged_image_md=list(display.merged_image_md),
+        user=await _user_brief(db, row.author_uid),
+    )
+
+
+# ============================================================
+# 陶片放逐（带同项合并）
+# ============================================================
+
+@router.get("/judgement", response_model=list[JudgementGroup])
+async def list_judgement(
+    limit: int = Query(50, ge=1, le=500),
+    before: datetime | None = Query(
+        None, description="分页锚点：拿严格早于此时间的，时间倒序游标分页"
+    ),
+    db: AsyncSession = Depends(get_db),
+) -> list[JudgementGroup]:
+    # 这里的 limit 是“合并后的处罚组”数量，而不是原始个人处罚行数量。
+    # 一次同原因批量处罚可能包含上百个用户；若先 LIMIT 原始行再合并，
+    # 首页会被同一组吃掉，用户需要多点几次加载更多才能翻过去。
+    raw_rows: list[Judgement] = []
+    cursor = before
+    batch_size = min(max(limit * 10, 200), 1000)
+    max_raw_rows = max(batch_size, min(20000, limit * 200))
+    has_more = True
+
+    while has_more and len(raw_rows) < max_raw_rows:
+        q = select(Judgement).order_by(desc(Judgement.time)).limit(batch_size)
+        if cursor is not None:
+            q = q.where(Judgement.time < cursor)
+        batch = (await db.execute(q)).scalars().all()
+        if not batch:
+            break
+
+        raw_rows.extend(batch)
+        cursor = batch[-1].time
+        has_more = len(batch) == batch_size
+
+        groups = await _group_judgements(db, raw_rows)
+        # 多拿 1 组作为边界缓冲，减少分页边界切在同一批处罚组里的概率。
+        if len(groups) >= limit + 1:
+            return groups[:limit]
+
+    groups = await _group_judgements(db, raw_rows)
+    return groups[:limit]
+
+
+async def _group_judgements(
+    session: AsyncSession, rows: list[Judgement]
+) -> list[JudgementGroup]:
+    """按 3.md 4.4.1 的合并规则生成分组。
+
+    规则：三者同时满足才合并 —— reason 相同、两个 permission 相同、相邻时间 ≤ 30 min。
+    """
+    window_sec = settings.JUDGEMENT_GROUP_TIME_WINDOW_SEC
+
+    # 先把 rows 按 (reason, revoked, added) 分桶
+    buckets: dict[tuple, list[Judgement]] = defaultdict(list)
+    for r in rows:
+        buckets[(r.reason, r.revoked_permission, r.added_permission)].append(r)
+
+    # 每桶内按时间排序再按 30min 切分为子组
+    groups: list[JudgementGroup] = []
+    for (reason, revoked, added), items in buckets.items():
+        items.sort(key=lambda x: x.time)
+        current: list[Judgement] = []
+        prev_time: datetime | None = None
+
+        async def _flush(bucket: list[Judgement]) -> None:
+            if not bucket:
+                return
+            users_info: list[_UserBrief] = []
+            for jt in bucket:
+                u = await _user_brief(session, jt.uid)
+                if u is None:
+                    u = _UserBrief(
+                        uid=jt.uid,
+                        name=jt.username_snapshot,
+                        color="Gray",
+                        badge=None,
+                        avatar=None,
+                    )
+                users_info.append(u)
+            groups.append(
+                JudgementGroup(
+                    group_key=f"{hash((reason, revoked, added, int(bucket[0].time.timestamp()))):x}",
+                    reason=reason,
+                    revoked_permission=revoked,
+                    added_permission=added,
+                    time_start=bucket[0].time,
+                    time_end=bucket[-1].time,
+                    users=users_info,
+                    count=len(bucket),
+                )
+            )
+
+        for it in items:
+            if prev_time is None or (it.time - prev_time).total_seconds() <= window_sec:
+                current.append(it)
+            else:
+                await _flush(current)
+                current = [it]
+            prev_time = it.time
+        await _flush(current)
+
+    # 按 time_end 倒序
+    groups.sort(key=lambda g: g.time_end, reverse=True)
+    return groups
+
+
+# ============================================================
+# 题目列表（按难度分组，仅开放题解的）
+# ============================================================
+
+@router.get("/problem/list", response_model=dict[str, ProblemDifficultyBucket])
+async def problem_list_by_difficulty(
+    preview_limit: int = Query(20, ge=1, le=200,
+                                description="每档返回的预览条数，前端默认 20"),
+    include_closed: bool = Query(False, description="是否包含'不可提交题解'的题"),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, ProblemDifficultyBucket]:
+    """按难度分桶返回题目预览：每档前 preview_limit 条 + 该档总数。
+
+    用户点"查看全部"再调 /problem/list/by-difficulty?difficulty=xxx 拉单档全量。
+    """
+    base_filter = [] if include_closed else [Problem.solution_open.is_(True)]
+
+    # 一次查全量再 group by 内存里切，省去对每个档单独打两遍 SQL。
+    # 分桶时归一化旧难度名，避免旧库数据和新难度体系拆成两栏。
+    q = select(Problem).order_by(Problem.difficulty, Problem.pid)
+    for f in base_filter:
+        q = q.where(f)
+    rows = (await db.execute(q)).scalars().all()
+
+    buckets: dict[str, list[ProblemItem]] = defaultdict(list)
+    for p in rows:
+        diff_name = _problem_difficulty_name(p.difficulty)
+        buckets[diff_name].append(
+            ProblemItem(
+                pid=p.pid,
+                title=p.title,
+                difficulty=diff_name,
+                tags=p.tags or [],
+                solution_open=p.solution_open,
+            )
+        )
+
+    return {
+        diff: ProblemDifficultyBucket(
+            items=items[:preview_limit],
+            total=len(items),
+        )
+        for diff, items in buckets.items()
+    }
+
+
+@router.get("/problem/list/by-difficulty", response_model=list[ProblemItem])
+async def problem_list_full_by_difficulty(
+    difficulty: str = Query(..., description="难度档名（如 '入门' / '暂无评定'）"),
+    include_closed: bool = Query(False),
+    db: AsyncSession = Depends(get_db),
+) -> list[ProblemItem]:
+    """单档全量。'暂无评定' 同时匹配 difficulty IS NULL 和字符串 '暂无评定'。
+
+    旧难度名会归并到公告里的新难度名，例如“普及/提高-”归入“普及”。
+    """
+    q = select(Problem).order_by(Problem.pid)
+    diff_name = _problem_difficulty_name(difficulty)
+    diff_values = _problem_difficulty_values(diff_name)
+    if diff_name == "暂无评定":
+        q = q.where(or_(Problem.difficulty.is_(None), Problem.difficulty.in_(diff_values)))
+    else:
+        q = q.where(Problem.difficulty.in_(diff_values))
+    if not include_closed:
+        q = q.where(Problem.solution_open.is_(True))
+    rows = (await db.execute(q)).scalars().all()
+    return [
+        ProblemItem(
+            pid=p.pid,
+            title=p.title,
+            difficulty=diff_name,
+            tags=p.tags or [],
+            solution_open=p.solution_open,
+        )
+        for p in rows
+    ]
+
+
+@router.get("/problem/{pid}", response_model=ProblemDetail)
+async def problem_detail(
+    pid: str,
+    db: AsyncSession = Depends(get_db),
+) -> ProblemDetail:
+    """返回单题难度、标签及题解开放状态和变更历史。"""
+
+    normalized = pid.strip().upper()
+    problem = await db.get(Problem, normalized)
+    if problem is None:
+        raise NotFoundError("题目未被本站收录")
+
+    history_q = (
+        select(ProblemSolutionHistory)
+        .where(ProblemSolutionHistory.pid == normalized)
+        .order_by(
+            desc(ProblemSolutionHistory.changed_at),
+            desc(ProblemSolutionHistory.id),
+        )
+    )
+    history = (await db.execute(history_q)).scalars().all()
+
+    return ProblemDetail(
+        pid=problem.pid,
+        title=problem.title,
+        difficulty=_problem_difficulty_name(problem.difficulty),
+        tags=problem.tags or [],
+        solution_open=problem.solution_open,
+        last_solution_check_at=problem.last_solution_check_at,
+        solution_history=[
+            ProblemSolutionHistoryItem(
+                solution_open=item.solution_open,
+                changed_at=item.changed_at,
+            )
+            for item in history
+        ],
+        first_seen_at=problem.first_seen_at,
+        updated_at=problem.updated_at,
+    )
+
+
+# ============================================================
+# 通用：最近一次成功爬取时间（list 页 OriginBanner 显示"上次更新"）
+# ============================================================
+
+@router.get("/last-crawled")
+async def last_crawled(
+    type: str = Query(..., description="task_type: judgement / problem_list / ..."),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """返回某类爬取任务最近一次 success 的 started_at（UTC ISO 字符串）。"""
+    from app.models._common import CrawlTaskStatus
+    from app.models.task import CrawlTask
+
+    q = (
+        select(CrawlTask.started_at)
+        .where(
+            CrawlTask.task_type == type,
+            CrawlTask.status == CrawlTaskStatus.success,
+        )
+        .order_by(CrawlTask.started_at.desc())
+        .limit(1)
+    )
+    row = (await db.execute(q)).scalar_one_or_none()
+    return {"last_crawled_at": row.isoformat() if row else None}
+
