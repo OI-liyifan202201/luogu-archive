@@ -16,8 +16,6 @@
 # 用法：
 #   ./start.sh             启动全部
 #   ./start.sh backend     只启动 backend
-#   ./start.sh frontend -dev  前端开发模式，不要求 build
-#   ./start.sh -dev        启动全部，前端使用开发模式
 #   ./start.sh status      查看状态
 # ======================================================================
 
@@ -34,67 +32,17 @@ UVICORN="$BACKEND/.venv/bin/uvicorn"
 mkdir -p "$RUN" "$LOGS"
 
 # ---------- 前置检查 ----------
-cmd="${1:-all}"
-frontend_dev=false
-if [ "$cmd" = "-dev" ]; then
-    cmd=all
-    frontend_dev=true
-fi
-if [ "$#" -gt 0 ]; then shift; fi
-for arg in "$@"; do
-    if [ "$arg" = "-dev" ] && [ "$frontend_dev" = false ]; then
-        frontend_dev=true
-    else
-        echo "用法: $0 [all|backend|worker|scheduler|frontend|status] [-dev]" >&2
-        exit 1
-    fi
-done
-if [ "$frontend_dev" = true ] && [ "$cmd" != all ] && [ "$cmd" != frontend ]; then
-    echo "!! -dev 仅适用于 all 或 frontend" >&2
-    exit 1
-fi
-
-# 只启动前端或查询状态时，不要求安装后端环境，方便独立部署预览站。
-case "$cmd" in
-    all|backend|worker|scheduler)
-        [ -f "$BACKEND/.env" ] || { echo "!! 未找到 $BACKEND/.env，先跑 ./install.sh" >&2; exit 1; }
-        [ -x "$PY" ] || { echo "!! 未找到 venv，先跑 ./install.sh" >&2; exit 1; }
-        ;;
-esac
-
-# 后端单独启动不依赖前端构建；启动全部时仍在启动任何服务前检查两侧。
-case "$cmd" in
-    all|frontend)
-        [ -f "$FRONTEND/.env" ] || { echo "!! 未找到 $FRONTEND/.env，请先配置前端环境变量" >&2; exit 1; }
-        if [ "$frontend_dev" = true ]; then
-            command -v pnpm >/dev/null 2>&1 || { echo "!! 未找到 pnpm，请先安装" >&2; exit 1; }
-            [ -f "$FRONTEND/node_modules/.bin/nuxt" ] || { echo "!! 前端依赖未安装，请先执行 (cd frontend && pnpm install)" >&2; exit 1; }
-        else
-            [ -f "$FRONTEND/.output/server/index.mjs" ] || { echo "!! 前端未构建，请先执行 (cd frontend && pnpm build)" >&2; exit 1; }
-        fi
-        ;;
-esac
+[ -f "$BACKEND/.env" ] || { echo "!! 未找到 $BACKEND/.env，先跑 ./install.sh" >&2; exit 1; }
+[ -x "$PY" ] || { echo "!! 未找到 venv，先跑 ./install.sh" >&2; exit 1; }
+[ -d "$FRONTEND/.output" ] || { echo "!! 前端未构建，先跑 ./install.sh 或 (cd frontend && pnpm build)" >&2; exit 1; }
 
 # 从 .env 读端口（简单 grep）
 get_env() {
     grep -E "^$1=" "$BACKEND/.env" | head -1 | cut -d= -f2-
 }
-BACKEND_PORT=8000
-FRONTEND_PORT=3000
-
-# 只读取实际需要的端口；配置未写端口时使用默认值，不因 grep 无匹配退出。
-case "$cmd" in
-    all|backend)
-        BACKEND_PORT=$(get_env WEB_PORT || true)
-        BACKEND_PORT=${BACKEND_PORT:-8000}
-        ;;
-esac
-case "$cmd" in
-    all|frontend)
-        FRONTEND_PORT=$(grep -E "^PORT=" "$FRONTEND/.env" | head -1 | cut -d= -f2 || true)
-        FRONTEND_PORT=${FRONTEND_PORT:-3000}
-        ;;
-esac
+BACKEND_PORT=$(get_env WEB_PORT); BACKEND_PORT=${BACKEND_PORT:-8000}
+FRONTEND_PORT=$(grep -E "^PORT=" "$FRONTEND/.env" 2>/dev/null | head -1 | cut -d= -f2)
+FRONTEND_PORT=${FRONTEND_PORT:-3000}
 
 # ---------- 启停工具 ----------
 pidfile() { echo "$RUN/$1.pid"; }
@@ -167,12 +115,7 @@ start_frontend() {
     cd "$FRONTEND"
     # 读前端 .env 作为环境
     set -a; source "$FRONTEND/.env"; set +a
-    if [ "$frontend_dev" = true ]; then
-        start_one frontend /usr/bin/env NODE_ENV=development pnpm dev \
-            --host 127.0.0.1 --port "$FRONTEND_PORT"
-    else
-        start_one frontend /usr/bin/env node "$FRONTEND/.output/server/index.mjs"
-    fi
+    start_one frontend /usr/bin/env node "$FRONTEND/.output/server/index.mjs"
 }
 
 # ---------- 状态 ----------
@@ -187,6 +130,7 @@ status() {
 }
 
 # ---------- 主逻辑 ----------
+cmd="${1:-all}"
 case "$cmd" in
     all)
         echo ">>> 启动 luogu-archive"
@@ -208,7 +152,7 @@ case "$cmd" in
     frontend)  start_frontend ;;
     status)    status ;;
     *)
-        echo "用法: $0 [all|backend|worker|scheduler|frontend|status] [-dev]"
+        echo "用法: $0 [all|backend|worker|scheduler|frontend|status]"
         exit 1
         ;;
 esac

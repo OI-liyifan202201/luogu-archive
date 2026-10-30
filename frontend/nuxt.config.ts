@@ -1,5 +1,3 @@
-const DEFAULT_API_BASE = 'https://luogu.qzz.io'
-
 // 允许环境变量填写源站、/api 或 /api/v1；内部统一归一化为源站，
 // 再由 API 客户端拼接 /api/v1。
 function normalizeApiBase(value: string | undefined): string {
@@ -8,8 +6,9 @@ function normalizeApiBase(value: string | undefined): string {
   return raw.replace(/\/+$/, '').replace(/\/api(?:\/v1)?$/i, '')
 }
 
-const publicApiBase = normalizeApiBase(process.env.NUXT_PUBLIC_API_BASE_URL) || DEFAULT_API_BASE
-const internalApiBase = normalizeApiBase(process.env.NUXT_API_INTERNAL_URL) || publicApiBase
+const publicApiBase = normalizeApiBase(process.env.NUXT_PUBLIC_API_BASE_URL)
+const internalApiBase = normalizeApiBase(process.env.NUXT_API_INTERNAL_URL)
+  || `http://127.0.0.1:${process.env.WEB_PORT || '8001'}`
 const extendedArchiveModulesEnabled = process.env.NUXT_PUBLIC_EXTENDED_ARCHIVE_MODULES_ENABLED === 'true'
 // 本地预览只代理到显式指定的主站；生产构建不启用，避免改变线上部署。
 const previewUpstream = process.env.ARCHIVE_PREVIEW_UPSTREAM?.replace(/\/+$/, '')
@@ -36,7 +35,7 @@ export default defineNuxtConfig({
   runtimeConfig: {
     apiInternalUrl: internalApiBase,
     public: {
-      // 浏览器直连的后端源站；默认使用带 CORS 的公开后端。
+      // 浏览器请求的后端源站；留空时使用同源 /api/v1（由反向代理转发）。
       apiBaseUrl: publicApiBase,
       apiPath: '/api/v1',
       extendedArchiveModulesEnabled,

@@ -7,7 +7,7 @@
 - **UI**：[@fluentui/web-components](https://www.npmjs.com/package/@fluentui/web-components) v3 + Fluent design tokens（`assets/css/fluent-tokens.css`）。
 - **图标**：全部使用 [lucide](https://lucide.dev/)（`lucide-vue-next`），包括原本由 Fluent 控件内部绘制的 chevron / checkmark。
 - **Markdown**：继续使用 `@luogu-saver-next/markdown-renderer`，入口见 `composables/useMarkdown.ts`。
-- **布局**：桌面为左侧图标栏（可访问的 `aria-label` / `title`），移动端为底部导航 + Fluent Drawer。
+- **布局**：桌面为左侧图标栏（可访问的 `aria-label` / `title`），移动端为底部导航 + 上拉菜单。
 - **SSR**：页面内容、统计与 Markdown 走 SSR；Fluent 自定义元素在客户端升级。
   会修改 light DOM 的复杂控件在客户端挂载（见 `components/f/Select.vue`），以保证 hydration 稳定。
 
@@ -24,10 +24,10 @@ pnpm preview   # 预览构建
 
 ## 后端地址
 
-浏览器端通过 `NUXT_PUBLIC_API_BASE_URL` 配置，默认 `https://luogu.qzz.io`（自带 CORS）。
+浏览器端通过 `NUXT_PUBLIC_API_BASE_URL` 配置；留空时使用同源 `/api/v1`（由反向代理转发）。
 可以填写源站、`/api` 或 `/api/v1`，`composables/useApiBase.ts` 会自动归一化，最终请求 `<源站>/api/v1/...`。
 
-服务端 SSR 默认使用同一地址；设置 `NUXT_API_INTERNAL_URL` 可以改为内网地址。
+服务端 SSR 通过 `NUXT_API_INTERNAL_URL` 配置，默认 `http://127.0.0.1:8001`，与原版仓库一致。
 
 跨域后端使用 Bearer token，并对 `Access-Control-Allow-Origin: *` 的后端关闭 Cookie
 （浏览器禁止通配符 + credentials 组合）。同源部署时自动恢复 `credentials: include`。
